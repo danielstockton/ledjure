@@ -8,6 +8,7 @@
 (def ^:const leading-zeros (apply str (repeat block-difficulty "0")))
 (def ^:const max-coins 1e6)
 (def ^:const min-tx 1/1000)
+(def ^:const reward 50)
 
 (defn now [] (System/currentTimeMillis))
 
@@ -38,10 +39,10 @@
 ;; Input -> (txid, amount)
 ;; Output -> (address, amount)
 
-(defrecord Transaction [ins outs]
+(defrecord Transaction [ins outs lock-time]
   Hashable
   (hash [this]
-    (sha256*2 (str (pr-str ins) (pr-str outs)))))
+    (sha256*2 (str (pr-str ins) (pr-str outs) lock-time))))
 
 (defprotocol Mineable
   (mine [this]))
@@ -72,55 +73,97 @@
           s (subs h 0 block-difficulty)]
       (= s leading-zeros))))
 
-(def genesis (->Block 0 "GENESIS" (now) 0 [(->Transaction [[]] [["address1" 50]])]))
+(def genesis (->Block 0 "GENESIS" (now) 0 [(->Transaction [] [] (now))]))
 
 (defprotocol Ledger
   (balance [this address]
     "Return the balance associated with the address.")
   (index [this]
     "Index txid -> transaction.")
-  (valid-tx? [this tx]
-    "Validate a new transaction:
+  (new-block [this address txs]
+    "Produce a new block ready for mining.")
+  (mine-block [this block]
+    "Complete PoW to produce a valid block.")
+  (valid-block? [this tx]
+    "Validate a new block. The block is allowed to contain a single transaction
+     with no inputs that outputs the agreed reward amount.
 
-     - Correct syntax and data structure.
-     - The values must be between 0 and 1 million.
-     - The transactions referenced by inputs must exist and by unspent.
-     - Input value must be greater than or equal to the output value.
-     - Reject if transaction value is below minimum."))
+     Each transaction must:
+
+     - Have correct syntax and data structure.
+     - Have values must be between 0 and 1 million.
+     - Reference by inputs that exist and are unspent.
+     - Have inputs greater than or equal to the outputs.
+     - Be rejected if transaction value is below minimum."))
+
+(def transaction-pool (clojure.lang.PersistentQueue/EMPTY))
 
 (deftype Blockchain [blocks]
   Ledger
-  (balance [this address])
+  (balance [this address]
+    (reduce (fn [bal [txid tx]]
+              (reduce (fn [b [a amount]]
+                        (if (= a address)
+                          (+ b amount)
+                          b))
+                      bal (:outs tx)))
+            0 (index this)))
   (index [this]
     (let [index' (transient {})]
       (doseq [b blocks]
-        (doseq [tx (:txs b)]
-          (doseq [[txid _] (:ins tx)]
-            (when txid
-              (assoc! index' txid true)))))
+        (when-not (= (:idx b) 0)
+          (doseq [tx (:txs b)]
+            (let [ins  (:ins tx)
+                  outs (:outs tx)]
+              (doseq [[txid _ :as in] ins]
+                (dissoc! index' txid))
+              (assoc! index' (hash tx) tx)))))
       (persistent! index')))
-  (valid-tx? [this tx]
-    (let [ins       (:ins tx)
-          outs      (:outs tx)
-          in-vals   (map second ins)
-          out-vals  (map second outs)
-          total-in  (reduce + in-vals)
-          total-out (reduce + out-vals)
-          index'    (index this)]
-      (when (> (count this) 1)
-        (doseq [[txid amount] ins]
-          (let [spent? (contains? index' txid)]
-            (assert (not spent?) "You spent those already!"))))
-      (assert (> total-in total-out) "Inputs less than outputs.")
-      (assert (> total-out min-tx) "Transaction too small.")
-      tx))
+  (valid-block? [this block]
+    (let [txs       (:txs block)
+          reward-tx (first (filter #(empty? (:ins %)) txs))]
+      (doseq [tx txs]
+        (let [ins       (:ins tx)
+              outs      (:outs tx)
+              index     (index this)
+              in-vals   (map second ins)
+              out-vals  (map second outs)
+              total-in  (reduce + in-vals)
+              total-out (reduce + out-vals)]
+          (assert (or (= tx reward-tx)
+                      (every? (fn [[txid amount]]
+                                (if-let [tx (get index txid)]
+                                  (let [outs (:outs tx)
+                                        out  (reduce + (map second outs))]
+                                    (>= (or out 0) amount))))
+                                ins))
+                  "Insufficient funds.")
+          (assert (valid? block)
+                  "No PoW demonstrated.")
+          (assert (or (not= tx reward-tx)
+                      (= total-out reward))
+                  "Reward is more than agreed.")
+          (assert (or (= tx reward-tx)
+                      (>= total-in total-out))
+                  "Input less than output.")
+          (assert (> total-out min-tx)
+                  "Transaction too small.")))
+      block))
+  (new-block [this address txs]
+    (let [reward-tx  (->Transaction [] [[address reward]] (now))
+          new-txs    (into [reward-tx] txs)
+          prev-block (peek blocks)]
+      (->Block (count this) (hash prev-block) (now) 0 new-txs)))
+  (mine-block [this block]
+    (let [mined (mine block)]
+      (try
+        (valid-block? this mined)
+        (catch AssertionError e mined))))
   clojure.lang.Seqable
   (seq [_] (seq blocks))
   clojure.lang.IPersistentVector
-  (cons [this txs]
-    (let [prev-block (peek blocks)
-          new-block  (->Block (count this) (hash prev-block) (now) 0 txs)]
-      (Blockchain. (conj blocks new-block))))
+  (cons [this block]
+    (Blockchain. (conj blocks block)))
   clojure.lang.Counted
   (count [_] (inc (.-idx (peek blocks))))
   clojure.lang.Indexed
@@ -129,30 +172,13 @@
 (def blockchain (->Blockchain [genesis]))
 
 (comment
-  (count blockchain)
 
-  (mine (nth blockchain 0))
+  ;;;; Server
 
-  (conj blockchain [1 2 3 4 5])
-
-  (valid-tx? blockchain (->Transaction [[nil 5]] [[nil 1]]))
-
-  (def t1 (->Transaction [["spent" 5]] [["address1" 1]]))
-
-  (def t2 (->Transaction [["spent" 5]] [["address2" 1]]))
-
-  (index (conj blockchain [t2]))
-
-  (valid-tx? (conj blockchain [t1]) t2)
-
-  )
-
-;;;; Server
-
-(defn handler [msg]
-  "hi!")
-
-(comment
+  (defn handler [msg]
+    (condp = msg
+      "new-transaction"
+        (conj transaction-pool "new-transaction")))
   (defn receive
     [socket]
     (.readLine (io/reader socket)))
