@@ -1,204 +1,135 @@
 (ns ledjure.core
-  (:refer-clojure :exclude [hash])
-  (:require [clojure.java.io :as io])
-  (:import [java.net ServerSocket]))
+  (:require [clojure.string :as str]
+            [integrant.core :as ig]
+            [io.aviso.ansi :as ansi]
+            [ledjure.blockchain :as blockchain]
+            [ledjure.server :as server]
+            [ledjure.crypto :as crypto]
+            [ledjure.util :as util]
+            [overtone.at-at :as at]))
 
-(def ^:const version 0.1)
-(def ^:const block-difficulty 4)
-(def ^:const leading-zeros (apply str (repeat block-difficulty "0")))
-(def ^:const max-coins 1e6)
-(def ^:const min-tx 1/1000)
-(def ^:const reward 50)
+(defn config [port peers]
+  {:blockchain {:wallet     (ig/ref :wallet)}
+   :handler    {:blockchain (ig/ref :blockchain)
+                :peers      (ig/ref :peers)
+                :tx-pool    (ig/ref :tx-pool)
+                :wallet     (ig/ref :wallet)}
+   :peers      {:peers peers}
+   :server     {:handler (ig/ref :handler)
+                :port    port}
+   :tx-pool    {}
+   :wallet     {}})
 
-(defn now [] (System/currentTimeMillis))
+(defmethod ig/init-key :blockchain [_ {:keys [blockchain wallet]}]
+  (atom (blockchain/new (-> wallet :address))))
 
-;;;; Crypto
+(defmethod ig/init-key :handler [_ opts]
+  (server/handler opts))
 
-(defn hash-digest [type data]
-  (.digest (java.security.MessageDigest/getInstance type)
-           (.getBytes data "UTF-8")))
+(defmethod ig/init-key :peers [_ {:keys [peers]}]
+  (atom peers))
 
-(defn hash-str [data-bytes]
-  (->> data-bytes
-       (map #(.substring
-              (Integer/toString
-               (+ (bit-and % 0xff) 0x100) 16) 1))
-       (apply str)))
+(defmethod ig/init-key :server [_ {:keys [handler port] :as opts}]
+  {:server (server/server handler port)
+   :port   port})
 
-(defn sha256 [data]
-  (hash-str (hash-digest "SHA-256" data)))
+(defmethod ig/init-key :tx-pool [_ _]
+  (clojure.lang.PersistentQueue/EMPTY))
 
-(defn sha256*2 [data]
-  (-> data (sha256) (sha256)))
+(defmethod ig/init-key :wallet [_ _]
+  {:address     (crypto/address crypto/public-key)
+   :public-key  crypto/public-key
+   :private-key crypto/private-key})
 
-;;;; Blockchain
+(defmethod ig/halt-key! :server [_ server]
+  (.close (:server server)))
 
-(defprotocol Hashable
-  (hash [this] [this nonce]))
+(defn system [port peer]
+  (let [port (Integer. port)]
+    (if peer
+      (let [[host pport]    (str/split peer #":")
+            {:keys [blockchain
+                    peers]} (server/send-msg host (Integer. pport)
+                                             {:k       :peers/sync
+                                              :payload {:host "localhost"
+                                                        :port port}})
+            peers           (into #{} (remove #(= (:port %) port) peers))
+            system          (ig/init (config port peers))]
+        (reset! (:blockchain system) blockchain)
+        system)
+      (ig/init (config port #{})))))
 
-;; Input -> (txid, amount)
-;; Output -> (address, amount)
+(defn sync-network
+  [system]
+  (let [peers @(:peers system)]
+    (if (empty? peers)
+      (println (ansi/red "No peers connected."))
+      (doseq [{:keys [host port]} peers]
+        (let [{:keys [blockchain
+                      peers
+                      txs
+                      address]} (server/send-msg
+                                 host port
+                                 {:k       :peers/sync
+                                  :payload {:host "localhost"
+                                            :port (-> system :server :port)}})
+              chain (:blockchain system)]
+          (when (> (count (:blocks blockchain))
+                   (count (:blocks @chain)))
+            (println "New chain!" blockchain)
+            (reset! chain blockchain)))))))
 
-(defrecord Transaction [ins outs lock-time]
-  Hashable
-  (hash [this]
-    (sha256*2 (str (pr-str ins) (pr-str outs) lock-time))))
+(defn send-coins
+  [system]
+  (let [blockchain @(:blockchain system)
+        wallet     (:wallet system)
+        address    (:address wallet)
+        peers      @(:peers system)
+        index      (blockchain/index blockchain)
+        utxos      (reduce (fn [res [txid tx]]
+                             (let [outs  (:outs tx)
+                                   total (->> outs
+                                              (map (fn [[a i]] (if (= a address) i 0)))
+                                              (apply +))]
+                               (if (pos? total)
+                                 (assoc res txid total)
+                                 res)))
+                           {} index)]
+    (doseq [{:keys [host port]} peers]
+      (let [info       (server/send-msg host port {:k :peers/info})
+            raddress   (:address info)
+            public-key (crypto/encode64 (.getEncoded (:public-key wallet)))
+            utxo       (first utxos)
+            txid       (first utxo)
+            sig        (crypto/sign txid crypto/private-key)
+            amount     (inc (rand-int 5))
+            change     (dec (- (second utxo) amount))
+            ins        [[txid sig public-key]]
+            outs       [[raddress amount] [address change]]
+            txs        [[ins outs (util/now)]]]
+        (server/send-msg host port
+                         {:k       :transactions/new
+                          :payload txs})))))
 
-(defprotocol Mineable
-  (mine [this]))
-
-(defprotocol Verifiable
-  (valid? [this] [this nonce]))
-
-(defrecord Block [idx prev tstamp nonce txs]
-  Hashable
-  (hash [this]
-    (hash this nonce))
-  (hash [this nonce]
-    (let [root (apply str txs)]
-      (sha256*2 (str version idx prev root tstamp block-difficulty nonce))))
-  Mineable
-  (mine [this]
-    (when (valid? this)
-      (throw (Exception. "Already mined ;)")))
-    (loop [n 0]
-      (if (valid? this n)
-        (->Block idx prev tstamp n txs)
-        (recur (inc n)))))
-  Verifiable
-  (valid? [this]
-    (valid? this nonce))
-  (valid? [this nonce]
-    (let [h (hash this nonce)
-          s (subs h 0 block-difficulty)]
-      (= s leading-zeros))))
-
-(def genesis (->Block 0 "GENESIS" (now) 0 [(->Transaction [] [] (now))]))
-
-(defprotocol Ledger
-  (balance [this address]
-    "Return the balance associated with the address.")
-  (index [this]
-    "Index txid -> transaction.")
-  (new-block [this address txs]
-    "Produce a new block ready for mining.")
-  (mine-block [this block]
-    "Complete PoW to produce a valid block.")
-  (valid-block? [this tx]
-    "Validate a new block. The block is allowed to contain a single transaction
-     with no inputs that outputs the agreed reward amount.
-
-     Each transaction must:
-
-     - Have correct syntax and data structure.
-     - Have values must be between 0 and 1 million.
-     - Reference by inputs that exist and are unspent.
-     - Have inputs greater than or equal to the outputs.
-     - Be rejected if transaction value is below minimum."))
-
-(def transaction-pool (clojure.lang.PersistentQueue/EMPTY))
-
-(deftype Blockchain [blocks]
-  Ledger
-  (balance [this address]
-    (reduce (fn [bal [txid tx]]
-              (reduce (fn [b [a amount]]
-                        (if (= a address)
-                          (+ b amount)
-                          b))
-                      bal (:outs tx)))
-            0 (index this)))
-  (index [this]
-    (let [index' (transient {})]
-      (doseq [b blocks]
-        (when-not (= (:idx b) 0)
-          (doseq [tx (:txs b)]
-            (let [ins  (:ins tx)
-                  outs (:outs tx)]
-              (doseq [[txid _ :as in] ins]
-                (dissoc! index' txid))
-              (assoc! index' (hash tx) tx)))))
-      (persistent! index')))
-  (valid-block? [this block]
-    (let [txs       (:txs block)
-          reward-tx (first (filter #(empty? (:ins %)) txs))]
-      (doseq [tx txs]
-        (let [ins       (:ins tx)
-              outs      (:outs tx)
-              index     (index this)
-              in-vals   (map second ins)
-              out-vals  (map second outs)
-              total-in  (reduce + in-vals)
-              total-out (reduce + out-vals)]
-          (assert (or (= tx reward-tx)
-                      (every? (fn [[txid amount]]
-                                (if-let [tx (get index txid)]
-                                  (let [outs (:outs tx)
-                                        out  (reduce + (map second outs))]
-                                    (>= (or out 0) amount))))
-                                ins))
-                  "Insufficient funds.")
-          (assert (valid? block)
-                  "No PoW demonstrated.")
-          (assert (or (not= tx reward-tx)
-                      (= total-out reward))
-                  "Reward is more than agreed.")
-          (assert (or (= tx reward-tx)
-                      (>= total-in total-out))
-                  "Input less than output.")
-          (assert (> total-out min-tx)
-                  "Transaction too small.")))
-      block))
-  (new-block [this address txs]
-    (let [reward-tx  (->Transaction [] [[address reward]] (now))
-          new-txs    (into [reward-tx] txs)
-          prev-block (peek blocks)]
-      (->Block (count this) (hash prev-block) (now) 0 new-txs)))
-  (mine-block [this block]
-    (let [mined (mine block)]
-      (try
-        (valid-block? this mined)
-        (catch AssertionError e mined))))
-  clojure.lang.Seqable
-  (seq [_] (seq blocks))
-  clojure.lang.IPersistentVector
-  (cons [this block]
-    (Blockchain. (conj blocks block)))
-  clojure.lang.Counted
-  (count [_] (inc (.-idx (peek blocks))))
-  clojure.lang.Indexed
-  (nth [_ idx] (nth blocks idx)))
-
-(def blockchain (->Blockchain [genesis]))
+(defn -main [& args]
+  (println (ansi/yellow "Starting node..."))
+  (let [[port peer] args
+        pool        (at/mk-pool)
+        system      (system port peer)]
+    (println (ansi/green (-> system :wallet :address)))
+    (at/every 5000 #(sync-network system) pool)
+    (when (nil? peer)
+        (at/every 10000 #(send-coins system) pool))
+    (while true
+      (Thread/sleep 100))))
 
 (comment
+  (def system (ig/init (config 1111 #{} nil)))
 
-  ;;;; Server
+  (ig/halt! system)
 
-  (defn handler [msg]
-    (condp = msg
-      "new-transaction"
-        (conj transaction-pool "new-transaction")))
-  (defn receive
-    [socket]
-    (.readLine (io/reader socket)))
+  (server/send-msg "localhost" 1111 {:k :peers/sync})
 
-  (defn send
-    [socket msg]
-    (let [writer (io/writer socket)]
-      (.write writer msg)
-      (.flush writer)))
+  (server/send-msg "localhost" 1111 {:k :transactions/new})
 
-  (defn server [port]
-    (let [running (atom true)]
-      (future
-        (with-open [server-sock (ServerSocket. port)]
-          (while @running
-            (with-open [sock (.accept server-sock)]
-              (let [msg-in  (receive sock)
-                    msg-out (handler msg-in)]
-                (send sock msg-out))))))
-      running))
-
-  (defn -main [& args]
-    (server 12345)))
+  )
