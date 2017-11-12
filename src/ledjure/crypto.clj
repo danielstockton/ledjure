@@ -63,10 +63,3 @@
 
 (defn address [pk]
   (encode64 (.getEncoded pk)))
-
-(comment
-  (def sig (sign "hello world" private-key))
-
-  (verify sig "hello world" public-key)
-
-  )

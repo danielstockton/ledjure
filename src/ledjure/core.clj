@@ -6,6 +6,7 @@
             [ledjure.server :as server]
             [ledjure.crypto :as crypto]
             [ledjure.util :as util]
+            [ledjure.wallet :as wallet]
             [overtone.at-at :as at]))
 
 (defn host-and-port [uri]
@@ -27,7 +28,7 @@
      :wallet     {}}))
 
 (defmethod ig/init-key :blockchain [_ {:keys [blockchain wallet]}]
-  (atom (blockchain/new (-> wallet :address))))
+  (atom (blockchain/new (ffirst @(-> wallet :addresses)))))
 
 (defmethod ig/init-key :handler [_ opts]
   (server/handler opts))
@@ -44,9 +45,8 @@
   (clojure.lang.PersistentQueue/EMPTY))
 
 (defmethod ig/init-key :wallet [_ _]
-  {:address     (crypto/address crypto/public-key)
-   :public-key  crypto/public-key
-   :private-key crypto/private-key})
+  (doto (wallet/->Wallet (atom {}))
+    (wallet/new-address)))
 
 (defmethod ig/halt-key! :server [_ server]
   (.close (:server server)))
@@ -92,42 +92,40 @@
 
 (defn send-coins
   [system]
-  (let [blockchain @(:blockchain system)
-        wallet     (:wallet system)
-        address    (:address wallet)
-        peers      @(:peers system)
-        index      (blockchain/index blockchain)
-        utxos      (reduce (fn [res [txid tx]]
-                             (let [outs  (:outs tx)
-                                   total (->> outs
-                                              (map (fn [[a i]] (if (= a address) i 0)))
-                                              (apply +))]
-                               (if (pos? total)
-                                 (assoc res txid total)
-                                 res)))
-                           {} index)]
+  (let [blockchain     @(:blockchain system)
+        wallet         (:wallet system)
+        [address keys] (first @(:addresses wallet))
+        peers          @(:peers system)
+        index          (blockchain/index blockchain)
+        utxos          (reduce (fn [res [txid tx]]
+                                 (let [outs  (:outs tx)
+                                       total (->> outs
+                                                  (map (fn [[a i]] (if (= a address) i 0)))
+                                                  (apply +))]
+                                   (if (pos? total)
+                                     (assoc res txid total)
+                                     res)))
+                               {} index)]
     (doseq [{:keys [host port]} peers]
-      (let [info       (server/send-msg host port {:k :peers/info})
-            raddress   (:address info)
-            public-key (crypto/encode64 (.getEncoded (:public-key wallet)))
+      (let [peer-info  (server/send-msg host port {:k :peers/info})
+            raddress   (:address peer-info)
+            public-key (crypto/encode64 (.getEncoded (:public-key keys)))
             utxo       (first utxos)
             txid       (first utxo)
-            sig        (crypto/sign txid crypto/private-key)
+            sig        (crypto/sign txid (:private-key keys))
             amount     (inc (rand-int 5))
             change     (dec (- (second utxo) amount))
             ins        [[txid sig public-key]]
             outs       [[raddress amount] [address change]]
-            txs        [[ins outs (util/now)]]]
-        (server/send-msg host port
-                         {:k       :transactions/new
-                          :payload txs})))))
+            tx         [ins outs (util/now)]]
+        (server/send-msg host port {:k :transactions/new :payload [tx]})))))
 
 (defn -main [& args]
   (println (ansi/yellow "Starting node..."))
   (let [[uri peer] args
         pool        (at/mk-pool)
         system      (system uri peer)]
-    (println (ansi/green (-> system :wallet :address)))
+    (println (ansi/green (ffirst @(-> system :wallet :addresses))))
     (at/every 5000 #(sync-network system) pool)
     (when (nil? peer)
         (at/every 10000 #(send-coins system) pool))
@@ -135,12 +133,8 @@
       (Thread/sleep 100))))
 
 (comment
-  (def system (ig/init (config 1111 #{} nil)))
+  (def system (ig/init (config "localhost:1111" #{{:host "localhost" :port 2222}})))
 
   (ig/halt! system)
-
-  (server/send-msg "localhost" 1111 {:k :peers/sync})
-
-  (server/send-msg "localhost" 1111 {:k :transactions/new})
 
   )

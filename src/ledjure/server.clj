@@ -41,28 +41,29 @@
 
 (defmethod dispatch :peers/info
   [_ {:keys [wallet]}]
-  {:address (:address wallet)})
+  {:address (ffirst @(:addresses wallet))})
 
 (defmethod dispatch :peers/sync
   [{:keys [payload]} {:keys [blockchain peers server tx-pool wallet]}]
   (let [{:keys [host port]} payload
-        blockchain          @blockchain]
+        blockchain          @blockchain
+        address             (ffirst @(-> wallet :addresses))]
     (when (< (count @peers) 100)
       (swap! peers conj payload))
     (println (ansi/blue (str "Connected peers: " (pr-str @peers))))
     (println (ansi/blue (str "Current balance: "
-                             (blockchain/balance blockchain (:address wallet)))))
+                             (blockchain/balance blockchain address))))
     {:blockchain blockchain
      :peers      @peers
      :txs        (vec tx-pool)
-     :address    (-> wallet :address)}))
+     :address    address}))
 
 (defmethod dispatch :transactions/new
   [{:keys [payload]} {:keys [blockchain tx-pool wallet]}]
   (let [txs (map #(apply blockchain/->Transaction %) payload)]
     (println (ansi/green (str "Incoming txs: " (pr-str txs))))
     ;; (conj tx-pool payload)
-    (let [address     (:address wallet)
+    (let [address     (ffirst @(:addresses wallet))
           blocks      (:blocks @blockchain)
           new-block   (blockchain/new-block @blockchain address txs)
           mined-block (blockchain/mine-block @blockchain new-block)
