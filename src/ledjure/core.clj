@@ -8,17 +8,23 @@
             [ledjure.util :as util]
             [overtone.at-at :as at]))
 
-(defn config [port peers]
-  {:blockchain {:wallet     (ig/ref :wallet)}
-   :handler    {:blockchain (ig/ref :blockchain)
-                :peers      (ig/ref :peers)
-                :tx-pool    (ig/ref :tx-pool)
-                :wallet     (ig/ref :wallet)}
-   :peers      {:peers peers}
-   :server     {:handler (ig/ref :handler)
-                :port    port}
-   :tx-pool    {}
-   :wallet     {}})
+(defn host-and-port [uri]
+  (let [[host port] (str/split uri #":")]
+    [host (Integer. port)]))
+
+(defn config [uri peers]
+  (let [[host port] (host-and-port uri)]
+    {:blockchain {:wallet (ig/ref :wallet)}
+     :handler    {:blockchain (ig/ref :blockchain)
+                  :peers      (ig/ref :peers)
+                  :tx-pool    (ig/ref :tx-pool)
+                  :wallet     (ig/ref :wallet)}
+     :peers      {:peers peers}
+     :server     {:handler (ig/ref :handler)
+                  :host    host
+                  :port    port}
+     :tx-pool    {}
+     :wallet     {}}))
 
 (defmethod ig/init-key :blockchain [_ {:keys [blockchain wallet]}]
   (atom (blockchain/new (-> wallet :address))))
@@ -29,8 +35,9 @@
 (defmethod ig/init-key :peers [_ {:keys [peers]}]
   (atom peers))
 
-(defmethod ig/init-key :server [_ {:keys [handler port] :as opts}]
+(defmethod ig/init-key :server [_ {:keys [handler host port] :as opts}]
   {:server (server/server handler port)
+   :host   host
    :port   port})
 
 (defmethod ig/init-key :tx-pool [_ _]
@@ -44,24 +51,28 @@
 (defmethod ig/halt-key! :server [_ server]
   (.close (:server server)))
 
-(defn system [port peer]
-  (let [port (Integer. port)]
+(defn system [uri peer]
+  (let [[host port] (host-and-port uri)]
     (if peer
-      (let [[host pport]    (str/split peer #":")
+      (let [[phost pport]   (host-and-port peer)
             {:keys [blockchain
-                    peers]} (server/send-msg host (Integer. pport)
+                    peers]} (server/send-msg phost pport
                                              {:k       :peers/sync
-                                              :payload {:host "localhost"
+                                              :payload {:host host
                                                         :port port}})
-            peers           (into #{} (remove #(= (:port %) port) peers))
-            system          (ig/init (config port peers))]
+            peers           (->> peers
+                                 (remove #(and (= (:host %) host)
+                                               (= (:port %) port)))
+                                 (into #{}))
+            system          (ig/init (config uri peers))]
         (reset! (:blockchain system) blockchain)
         system)
-      (ig/init (config port #{})))))
+      (ig/init (config uri #{})))))
 
 (defn sync-network
   [system]
-  (let [peers @(:peers system)]
+  (let [{:keys [peers server]} system
+        peers                  @peers]
     (if (empty? peers)
       (println (ansi/red "No peers connected."))
       (doseq [{:keys [host port]} peers]
@@ -71,9 +82,9 @@
                       address]} (server/send-msg
                                  host port
                                  {:k       :peers/sync
-                                  :payload {:host "localhost"
-                                            :port (-> system :server :port)}})
-              chain (:blockchain system)]
+                                  :payload {:host (:host server)
+                                            :port (:port server)}})
+              chain             (:blockchain system)]
           (when (> (count (:blocks blockchain))
                    (count (:blocks @chain)))
             (println "New chain!" blockchain)
@@ -113,9 +124,9 @@
 
 (defn -main [& args]
   (println (ansi/yellow "Starting node..."))
-  (let [[port peer] args
+  (let [[uri peer] args
         pool        (at/mk-pool)
-        system      (system port peer)]
+        system      (system uri peer)]
     (println (ansi/green (-> system :wallet :address)))
     (at/every 5000 #(sync-network system) pool)
     (when (nil? peer)
